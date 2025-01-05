@@ -831,6 +831,7 @@ class OptLM:
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
                  verbose: int = 0):
+        print("input len:", [len(inputs[i]) for i in range(len(inputs))], ", max new tokens:", max_new_tokens)
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -907,7 +908,7 @@ class OptLM:
         if self.policy.cpu_cache_compute:
             self.env.cpu.del_attention_compute_workspace()
 
-        return self.output_ids
+        return self.output_ids[:, prompt_len:]
 
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
@@ -1243,6 +1244,14 @@ def run_flexgen(args):
 
     projected = bool(args.debug_mode or cut_gen_len)
 
+    outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    show_str = "Outputs:\n" + 70 * '-' + "\n"
+    for i in range(len(outputs)):
+        show_str += "output len: " + str(len(output_ids[i])) + "\n"
+        show_str += f"{i}: {outputs[i]}\n"
+        show_str += "-" * 70 + "\n"
+    print(show_str)
+
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
     if args.compress_cache:
         print("FlexGen + INT4")
@@ -1297,6 +1306,10 @@ def add_parser_arguments(parser):
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
 
+    parser.add_argument("--alpha", type=int, default=10)
+    parser.add_argument("--partial-weight-ratio", type=float, default=0.2)
+    parser.add_argument("--max-num-kv", type=int, default=400)
+    
     parser.add_argument("--warmup-input-path", type=str)
     parser.add_argument("--test-input-path", type=str)
 

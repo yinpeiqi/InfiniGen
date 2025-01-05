@@ -82,3 +82,46 @@ def skew(query, key, wq, wk, n_head, head_dim):
         wq[start:end, :] = A.t() @ wq[start:end]
         wk[start:end, :] = A.t() @ wk[start:end]
     return wq, wk
+
+
+def llama_skew(query, key, n_head, head_dim):
+    """Manipulates the query/key weight matrix for skewing the qeury and key matrix.
+
+    On the warmup phase, manipulates the query/key weight matrix for
+    skewing the query and key matrix. By doing so, a few columns of
+    the query and key matrix have become much more important. We use
+    the columns for attention speculation.
+
+    Args:
+        query: Query matrix (b, n, h, d)
+        key: Key matrix (b, n, h, d)
+        w_q: Concatenated query weight and bias (D, D+1)
+        w_k: Concatenated key weight and bias (D, D+1)
+        n_head: Number of heads which we refer to as h
+        head_dim: Hidden dimension of each head which we refer to as d
+
+    Returns:
+        w_q: Manipulated w_q (D, D+1)
+        w_k: Manipulated w_k (D, D+1)
+
+    """
+
+    A = torch.zeros(n_head, head_dim, head_dim).to(torch.float16).to(query.device)
+    for h_idx in range(n_head):
+        start = h_idx * head_dim
+        end = (h_idx + 1) * head_dim
+        uq, sq, vq = torch.svd(query[0, :, h_idx].to(torch.float))
+        uk, sk, vk = torch.svd(key[0, :, h_idx].to(torch.float))
+        sq = sq.to(torch.float16)
+        vq = vq.to(torch.float16)
+        sk = sk.to(torch.float16)
+        sq = sq * sk
+        a = torch.zeros(head_dim, head_dim).to(query.device).to(torch.float16)
+        _, ind = sq.sort()
+        A[h_idx] = a.scatter(-1, ind.unsqueeze(0).repeat(head_dim, 1), vq).to(torch.float16)
+
+        # A = A.scatter(-1, ind.unsqueeze(0).repeat(head_dim, 1), vq).to(torch.float16)
+        # wq[start:end, :] = A.t() @ wq[start:end]
+        # wk[start:end, :] = A.t() @ wk[start:end]
+
+    return A

@@ -59,5 +59,6 @@ def speculate_attention(hidden, p_w_q, p_k_c, n_head, alpha, max_num_kv):
     prefetch_idx = torch.topk(
         p_attn.permute(2, 1, 0), min(int(mean), max_num_kv), dim=0
     )[1]
+    # print(prefetch_idx.shape, prefetch_idx)
 
     return prefetch_idx

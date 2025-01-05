@@ -17,8 +17,8 @@ from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
 
-from infinigen.skewing_controller import reform_hidden_states, skew
-from infinigen.partial_weight_generation_controller import partial_weight_index_generation
+from infinigen.skewing_controller import reform_hidden_states, skew, llama_skew
+from infinigen.partial_weight_generation_controller import partial_weight_index_generation, llama_partial_weight_index_generation
 from infinigen.kv_selection_controller import speculate_attention
 
 general_copy_compressed = TorchCompressedDevice = None
@@ -299,7 +299,7 @@ class TorchDevice:
         v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
         return k_cache, v_cache
 
-    def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
+    def mha(self, inputs, layer_id, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
             w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config, warmup=False, partial_weight_ratio=0.1):
         """Multi-head attention (prefill phase)."""
         # decompress weights
@@ -992,6 +992,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class LlamaTorchDevice(TorchDevice):
+    def __init__(self, name, mem_capacity=None, flops=None):
+        super().__init__(name, mem_capacity, flops)
+        self.skewing_matrix = {}
 
     def llama_input_embed(self, inputs, attention_mask, w_token, pad_token_id, donate):
         # decompress weights
@@ -1026,7 +1029,7 @@ class LlamaTorchDevice(TorchDevice):
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
-    def llama_mha(self, inputs, position_ids, attention_mask, w_ln, w_q, w_k, w_v,
+    def llama_mha(self, inputs, layer_id, position_ids, attention_mask, w_ln, w_q, w_k, w_v,
             w_re, w_out, n_head, n_kv_head, donate, eps, compress_cache, comp_config, warmup=False, partial_weight_ratio=0.1):
         """Multi-head attention (prefill phase)."""
         # decompress weights
@@ -1047,10 +1050,19 @@ class LlamaTorchDevice(TorchDevice):
         q = F.linear(hidden, w_q.data) * scaling
         k = F.linear(hidden, w_k.data)
         v = F.linear(hidden, w_v.data)
+
+        # Partial weight index generation
+        partial_weight_index = None
+        if (not warmup) and (partial_weight_ratio is not None):
+            partial_weight_index = llama_partial_weight_index_generation(q, n_head, head_dim, self.skewing_matrix[layer_id], partial_weight_ratio)
         # shape: (b, s, n_head, head_dim)
         q = q.view(b, s, n_head, head_dim)
         k = k.view(b, s, n_kv_head, head_dim)
         v = v.view(b, s, n_kv_head, head_dim)
+
+        # Generate skewing matrix
+        if warmup:
+            self.skewing_matrix[layer_id] = llama_skew(q, k, n_head, head_dim)
 
         kv_seq_len = k.shape[-3]
         cos, sin = rotary_embedding(v, w_re.data, seq_len=kv_seq_len)
@@ -1102,11 +1114,11 @@ class LlamaTorchDevice(TorchDevice):
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
 
-        return TorchTensor.create_from_torch(value, self), k, v
+        return TorchTensor.create_from_torch(value, self), k, v, w_q, w_k, partial_weight_index
 
     def llama_mha_gen(self, inputs, position_ids, attention_mask, w_ln, w_q, w_k, w_v,
                 w_re, w_out, eps, n_head, n_kv_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config):
+                attn_sparsity, compress_cache, comp_config, p_w_q, partial_k_cache, speculation_stream, alpha, max_num_kv):
         """Multi-head attention (decoding phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -1117,12 +1129,17 @@ class LlamaTorchDevice(TorchDevice):
             w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
-        src_s = attention_mask.shape[1]
+        src_s = min(attention_mask.shape[1], k_cache.shape[0] + 1)
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 
         hidden = rms_norm(inputs.data, weight=w_ln.data, eps=eps)
-
+        # Speculate attention
+        prefetch_idx = None
+        if p_w_q is not None:
+            with torch.cuda.stream(speculation_stream):
+                prefetch_idx = speculate_attention(hidden, p_w_q, partial_k_cache, n_head, alpha, max_num_kv)
+        # print(src_s, prefetch_idx)
         # shape: (b, 1, h)
         q = F.linear(hidden, w_q.data) * scaling
         k = F.linear(hidden, w_k.data)
@@ -1154,23 +1171,23 @@ class LlamaTorchDevice(TorchDevice):
                     v = v_cache.device.decompress(v_cache)[:src_s]
                 else:
                     # shape: (s, b * n_head, head_dim)
-                    k = k_cache.data[:src_s]
-                    v = v_cache.data[:src_s]
-                k[src_s - 1:src_s] = k_new
-                v[src_s - 1:src_s] = v_new
+                    k = k_cache.data[:src_s-1]
+                    v = v_cache.data[:src_s-1]
+                k  = torch.cat((k, k_new), dim = 0)
+                v  = torch.cat((v, v_new), dim = 0)
 
                 # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
+                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, -1)
                 # shape: (b * n_head, s, head_dim)
-                v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
+                v = v.permute(1, 0, 2).reshape(b * n_head, -1, head_dim)
 
                 if k.is_cuda:
-                    value = self._attention_value(q, k, v, attention_mask.data,
+                    value = self._attention_value(q, k, v, None,
                         b, src_s, tgt_s, n_head, head_dim)
                 else:
                     q = q.float().to('cpu')
                     k, v = k.float(), v.float()
-                    value = self._attention_value(q, k, v, attention_mask.data,
+                    value = self._attention_value(q, k, v, None,
                         b, src_s, tgt_s, n_head, head_dim).half().cuda()
             else:  # Sparse attention
                 # shape: (s, b * n_head, head_dim)
@@ -1214,7 +1231,7 @@ class LlamaTorchDevice(TorchDevice):
             k_new = TorchTensor.create_from_torch(k_new, self)
             v_new = TorchTensor.create_from_torch(v_new, self)
 
-        return TorchTensor.create_from_torch(value, self), k_new, v_new
+        return TorchTensor.create_from_torch(value, self), k_new, v_new, prefetch_idx
 
     def llama_mlp(self, inputs, w_ln, w_g, w_u, w_d, eps, donate):
         # decompress weights

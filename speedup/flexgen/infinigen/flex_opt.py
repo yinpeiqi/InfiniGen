@@ -512,7 +512,7 @@ class SelfAttention:
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            h, new_k_cache, new_v_cache, w_q, w_k, self.partial_index = self.compute.mha(h, mask, w_q, b_q,
+            h, new_k_cache, new_v_cache, w_q, w_k, self.partial_index = self.compute.mha(h, self.layer_id, mask, w_q, b_q,
                 w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
                 self.policy.compress_cache, self.policy.comp_cache_config, warmup, self.partial_weight_ratio)
             cache_write_buf.store((new_k_cache, new_v_cache))
@@ -924,6 +924,8 @@ class OptLM:
                         self.weight_read_buf[j], self.attention_mask[k],
                         self.cache_write_buf[j][k], i, k, warmup_state, self.partial_weight_read_buf[j], self.partial_cache_read_buf[j][k], self.speculation_stream,
                         None, None, self.weight_home[j])
+            else:
+                print("Not executed!")
         else:
             self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
                 self.weight_read_buf[j], self.attention_mask[k],
@@ -971,6 +973,7 @@ class OptLM:
                  cut_gen_len: Optional[int] = None,
                  verbose: int = 0,
                  warmup: bool = False):
+        print("input len:", [len(inputs[i]) for i in range(len(inputs))], ", max new tokens:", max_new_tokens)
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -1050,7 +1053,7 @@ class OptLM:
         if self.policy.cpu_cache_compute:
             self.env.cpu.del_attention_compute_workspace()
 
-        return self.output_ids
+        return self.output_ids[:, prompt_len:]
 
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
@@ -1328,10 +1331,11 @@ def get_inputs(prompt_len, num_prompts, tokenizer, path):
     return (input_ids[0],) * num_prompts
 
 def run_flexgen(args):
-    if args.model == "facebook/galactica-30b":
-        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
-    else:
-        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+    # if args.model == "facebook/galactica-30b":
+    #     tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
+    # else:
+    #     tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained("facebook/opt-6.7b", padding_side="left")
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
 
@@ -1359,19 +1363,36 @@ def run_flexgen(args):
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
-    cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
-    hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
+    # cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
+    # hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
     model = OptLM(opt_config, env, args.path, policy, args.partial_weight_ratio, args.alpha, args.max_num_kv)
+    print("model loaded, start inference.")
+
+    from datasets import load_dataset
+    dataset = load_dataset('ccdv/arxiv-summarization', split='test')
+    # prompt_format = "You are given a scientific paper and asked to write a summary of it.\n\n Here is the context of the paper:\n{0}\n\nNow, write a summary of the paper.\n\nSummary:"
+    prompt_format = "You are given a scientific paper and asked to write a summary of it.\n Now, write a summary of the paper.\n Here is the context of the paper:\n{0}"
 
     try:
         output_ids = model.generate(
             warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+
+        # for idx in tqdm.tqdm(range(200)):
+        idx=0
+        prompt = prompt_format.format(dataset['article'][idx])[:prompt_len]
+        prompt = "What is the weather like today?"
+        print(prompt)
+        answer = dataset['abstract'][idx]
+        input_ids = tokenizer(prompt, padding="max_length", max_length=prompt_len).input_ids
 
         timers("generate").reset()
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
+        # result = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        # print(result)
+        # print("input and output lens:", len(input_ids), len(output_ids[0]) - len(input_ids))
     finally:
         env.close_copy_threads()
 
@@ -1390,6 +1411,15 @@ def run_flexgen(args):
     _, cpu_peak_mem = cpu.mem_stats()
 
     projected = bool(args.debug_mode or cut_gen_len)
+
+    outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    show_str = "Outputs:\n" + 70 * '-' + "\n"
+    for i in range(len(outputs)):
+        show_str += "output len: " + str(len(output_ids[i])) + "\n"
+        outputs[i] = outputs[i].replace("\n", "\\n ")
+        show_str += f"{i}: {outputs[i]}\n"
+        show_str += "-" * 70 + "\n"
+    print(show_str)
 
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
     print("InfiniGen (Ours)")
@@ -1442,7 +1472,7 @@ def add_parser_arguments(parser):
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
 
-    parser.add_argument("--alpha", type=int, default=4)
+    parser.add_argument("--alpha", type=int, default=10)
     parser.add_argument("--partial-weight-ratio", type=float, default=0.2)
     parser.add_argument("--max-num-kv", type=int, default=400)
     
