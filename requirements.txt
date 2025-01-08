@@ -5,3 +5,6 @@ sentencepiece
 lm-eval==0.3.0
 ftfy
 accelerate
+numpy=1.26.4
+pynvml
+protobuf

@@ -876,6 +876,17 @@ class OptLM:
             val = self.hidden[i][j-1][k].pop().move(dst)
         self.hidden[i][j][k].store(val)
 
+    def get_sparsity_and_clear(self):
+        if self.policy.cpu_cache_compute:
+            device = self.env.cpu
+        else:
+            device = self.env.gpu
+        if len(device.sparsity) == 0:
+            return 0
+        sparsity_avg = sum(device.sparsity) / len(device.sparsity)
+        device.sparsity.clear()
+        return sparsity_avg
+
     def store_hidden(self, i, j, k):
         # Handle corner cases
         if k == -1:
@@ -992,6 +1003,8 @@ class OptLM:
         self.warmup = warmup
 
         # Output token ids
+        self.prompt_len = prompt_len
+        self.exact_gen_len = 0
         self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
             self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
@@ -1053,9 +1066,10 @@ class OptLM:
         if self.policy.cpu_cache_compute:
             self.env.cpu.del_attention_compute_workspace()
 
-        return self.output_ids[:, prompt_len:]
+        return self.output_ids[:, prompt_len:prompt_len + self.exact_gen_len]
 
     def generation_loop_normal(self):
+        self.exact_gen_len = self.execute_gen_len
         for i in range(self.execute_gen_len):
             timers("generate").start()
             for k in range(self.num_gpu_batches):
@@ -1077,6 +1091,10 @@ class OptLM:
                         self.prefetch_cache(i, j, k, overlap=True)
                         self.prefetch_evt.record()
             timers("generate").stop()
+            if (self.output_ids.shape[0] == 1):
+                if int(self.output_ids[0][self.prompt_len + i]) == self.config.eos_token_id:
+                    self.exact_gen_len = i
+                    break
 
     def generation_loop_debug_normal(self):
         execute_num_batches = 20

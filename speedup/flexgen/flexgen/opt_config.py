@@ -28,6 +28,7 @@ class OptConfig:
     vocab_size: int = 50272
     layer_norm_eps: float = 0.00001
     pad_token_id: int = 1
+    eos_token_id: int = 2
     dtype: type = np.float16
 
     def model_bytes(self):

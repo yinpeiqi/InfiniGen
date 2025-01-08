@@ -23,8 +23,10 @@ class LlamaConfig:
     num_hidden_layers: int = 32
     num_key_value_heads: int = 32
     rms_norm_eps: float = 1e-05
+    rope_theta: float = 10000
     dtype: type = np.float16
-    pad_token_id: int = 2
+    pad_token_id: int = 0
+    eos_token_id: int = 2
     vocab_size: int = 32000
 
     def model_bytes(self):
@@ -64,12 +66,13 @@ def get_llama_config(name, **kwargs):
                              input_dim=4096, intermediate_size=11008, n_head=32,
                              num_hidden_layers=32, num_key_value_heads=32,
                              max_position_embeddings=32000, pad_token_id=0,
-                             rms_norm_eps=1e-6
+                             rms_norm_eps=1e-6, rope_theta=50000000.0
                              )
     elif arch_name == "Llama-2-7b-hf":
         config = LlamaConfig(name=name, hf_token=kwargs.get('hf_token'),
                              input_dim=4096, intermediate_size=11008, n_head=32,
-                             num_hidden_layers=32, num_key_value_heads=32
+                             num_hidden_layers=32, num_key_value_heads=32, pad_token_id=0,
+                             rms_norm_eps=1e-5, rope_theta=10000.0
                              )
     elif arch_name == "Llama-2-13b-hf":
         config = LlamaConfig(name=name, hf_token=kwargs.get('hf_token'),
@@ -101,9 +104,9 @@ def download_llama_weights(model_name, path, hf_token):
     elif ("LWM" in model_name):
         hf_model_name = "LargeWorldModel/" + model_name
         
-    folder = snapshot_download(model_name, allow_patterns="*.bin", token=hf_token)
+    folder = snapshot_download(hf_model_name, allow_patterns="*.bin", token=hf_token)
     bin_files = glob.glob(os.path.join(folder, "*.bin"))
-
+    
     if "/" in model_name:
         model_name = model_name.split("/")[1]
     path = os.path.join(path, f"{model_name}-np")

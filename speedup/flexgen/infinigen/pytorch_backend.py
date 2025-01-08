@@ -8,6 +8,7 @@ import shutil
 import time
 import threading
 from typing import Optional, Union, Tuple
+import pynvml
 
 import torch
 import torch.nn.functional as F
@@ -180,6 +181,7 @@ class TorchDevice:
         if self.device_type == DeviceType.CPU:
             global global_cpu_device
             global_cpu_device = self
+        self.sparsity = []
 
     def add_link(self, link):
         dst = link.b if link.a == self else link.a
@@ -391,6 +393,7 @@ class TorchDevice:
 
         b, tgt_s, h = inputs.shape
         src_s = min(attention_mask.shape[1], k_cache.shape[0] + 1)
+        self.sparsity.append(1.0 * k_cache.shape[0] / attention_mask.shape[1])
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 
@@ -929,7 +932,7 @@ def copy_worker_func(queue, cuda_id):
 
 def rms_norm(input, weight, eps) -> torch.Tensor:
     input_dtype = input.dtype
-    hidden_states = input.to(torch.float16)
+    hidden_states = input.to(torch.float32)
     variance = hidden_states.pow(2).mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + eps)
     return weight * hidden_states.to(input_dtype)
@@ -937,7 +940,7 @@ def rms_norm(input, weight, eps) -> torch.Tensor:
 
 def rotary_embedding(x, inv_freq, seq_len):
     t = torch.arange(seq_len, device=x.device, dtype=inv_freq.dtype)
-    freqs = torch.outer(t, inv_freq.to(x.device))
+    freqs = torch.einsum("i,j -> ij", t, inv_freq.to(x.device))
     emb = torch.cat((freqs, freqs), dim=-1)
     return (
         emb.cos().to(x.dtype)[:seq_len].to(dtype=x.dtype),
@@ -972,10 +975,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=2):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    cos_p = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin_p = sin[position_ids].unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos_p) + (rotate_half(q) * sin_p)
+    k_embed = (k * cos_p) + (rotate_half(k) * sin_p)
     return q_embed, k_embed
 
 
@@ -1064,9 +1067,11 @@ class LlamaTorchDevice(TorchDevice):
         if warmup:
             self.skewing_matrix[layer_id] = llama_skew(q, k, n_head, head_dim)
 
-        kv_seq_len = k.shape[-3]
-        cos, sin = rotary_embedding(v, w_re.data, seq_len=kv_seq_len)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        if not hasattr(self, 'inv_freq'):
+            rotary_dim = w_re.data.shape[0] * 2
+            self.inv_freq = 1.0 / (50000000.0 ** (torch.arange(0, rotary_dim, 2).to(torch.float) / rotary_dim))
+            self.cos, self.sin = rotary_embedding(v, self.inv_freq, seq_len=32000)
+        q, k = apply_rotary_pos_emb(q, k, self.cos, self.sin, position_ids)
 
         n_kv_groups = n_head // n_kv_head
         k = repeat_kv(k, n_kv_groups)
@@ -1084,8 +1089,7 @@ class LlamaTorchDevice(TorchDevice):
 
         # shape: (b, 1, s, s)
         idx = torch.arange(s, device=self.dev)
-        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
-        mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
+        mask = attention_mask.data.view(b, 1, 1, s) & (idx <= idx.view(s, 1)).view(1, 1, s, s)
 
         # shape: (b, n_head, s, s)
         attn_weights = attn_weights.view(b, n_head, s, s)
@@ -1094,6 +1098,10 @@ class LlamaTorchDevice(TorchDevice):
         attn_weights = F.softmax(attn_weights, dim=2)
         # shape: (b, n_head, s, head_dim)
         value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
+
+        del attn_weights
+        torch.cuda.empty_cache()
+
         # shape: (b, s, h)
         value = value.transpose(1, 2).reshape(b, s, h)
         value = F.linear(value, w_out.data)
@@ -1130,6 +1138,7 @@ class LlamaTorchDevice(TorchDevice):
 
         b, tgt_s, h = inputs.shape
         src_s = min(attention_mask.shape[1], k_cache.shape[0] + 1)
+        self.sparsity.append(1.0 * k_cache.shape[0] / attention_mask.shape[1])
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 
@@ -1149,8 +1158,11 @@ class LlamaTorchDevice(TorchDevice):
         k = k.view(b, tgt_s, n_kv_head, head_dim)
         v = v.view(b, tgt_s, n_kv_head, head_dim)
 
-        cos, sin = rotary_embedding(v, w_re.data, seq_len=position_ids.max().item() + 1)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        if not hasattr(self, 'inv_freq'):
+            rotary_dim = w_re.data.shape[0] * 2
+            self.inv_freq = 1.0 / (50000000.0 ** (torch.arange(0, rotary_dim, 2).to(torch.float) / rotary_dim))
+            self.cos, self.sin = rotary_embedding(v, self.inv_freq, seq_len=32000)
+        q, k = apply_rotary_pos_emb(q, k, self.cos, self.sin, position_ids)
 
         n_kv_groups = n_head // n_kv_head
         k = repeat_kv(k, n_kv_groups)

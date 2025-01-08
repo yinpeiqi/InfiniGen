@@ -17,8 +17,6 @@ from flexgen.timer import timers
 from flexgen.utils import (ExecutionEnv, GB, ValueHolder,
     array_1d, array_2d, str2bool, project_decode_latency, write_benchmark_log)
 
-from infinigen.skewing_controller import weight_bias_concat
-from infinigen.kv_selection_controller import select_kv
 from infinigen.partial_weight_generation_controller import set_partial_cache, set_partial_weight
 
 fix_recursive_import()
@@ -384,9 +382,9 @@ def run_flexgen(args):
     print("init weight...")
     model = LlamaLM(llama_config, env, args.path, policy, args.partial_weight_ratio, args.alpha, args.max_num_kv)
 
-    from datasets import load_dataset
-    dataset = load_dataset('ccdv/arxiv-summarization', split='test')
-    prompt_format = "You are given a scientific paper and asked to write a summary of it.\n\n Here is the context of the paper:\n{0}\n\nNow, write a summary of the paper.\n\nSummary:"
+    # from datasets import load_dataset
+    # dataset = load_dataset('ccdv/arxiv-summarization', split='test')
+    # prompt_format = "You are given a scientific paper and asked to write a summary of it.\n\n Here is the context of the paper:\n{0}\n\nNow, write a summary of the paper.\n\nSummary:"
 
     try:
         print("warmup - generate")
@@ -430,6 +428,9 @@ def run_flexgen(args):
             show_str += "-" * 70 + "\n"
         if args.verbose >= 2:
             print(show_str)
+    
+    sparsity_rate = model.get_sparsity_and_clear()
+    print("sparsity rate:", sparsity_rate)
 
     gpu.print_stats()
     cpu.print_stats()

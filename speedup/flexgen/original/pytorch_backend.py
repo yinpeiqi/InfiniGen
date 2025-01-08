@@ -9,6 +9,7 @@ import time
 import threading
 from typing import Optional, Union, Tuple
 
+import pynvml
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -908,7 +909,7 @@ def copy_worker_func(queue, cuda_id):
 
 def rms_norm(input, weight, eps) -> torch.Tensor:
     input_dtype = input.dtype
-    hidden_states = input.to(torch.float16)
+    hidden_states = input.to(torch.float32)
     variance = hidden_states.pow(2).mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + eps)
     return weight * hidden_states.to(input_dtype)
@@ -1032,8 +1033,15 @@ class LlamaTorchDevice(TorchDevice):
         v = v.view(b, s, n_kv_head, head_dim)
 
         kv_seq_len = k.shape[-3]
-        cos, sin = rotary_embedding(v, w_re.data, seq_len=kv_seq_len)
+        rotary_dim = w_re.data.shape[0] * 2
+        inv_freq = 1.0 / (50000000.0 ** (torch.arange(0, rotary_dim, 2).to(torch.float) / rotary_dim))
+        cos, sin = rotary_embedding(v, inv_freq, seq_len=kv_seq_len)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        
+        # pynvml.nvmlInit()
+        # h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        # info = pynvml.nvmlDeviceGetMemoryInfo(h)
+        # print("1 total:", info.total, ", free:", info.free, ", used:", info.used)
 
         n_kv_groups = n_head // n_kv_head
         k = repeat_kv(k, n_kv_groups)
@@ -1049,6 +1057,8 @@ class LlamaTorchDevice(TorchDevice):
         # shape: (b * n_head, s, s)
         attn_weights = torch.bmm(q, k)
 
+        # info = pynvml.nvmlDeviceGetMemoryInfo(h)
+        # print("2 total:", info.total, ", free:", info.free, ", used:", info.used)
         # shape: (b, 1, s, s)
         idx = torch.arange(s, device=self.dev)
         causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
@@ -1056,11 +1066,17 @@ class LlamaTorchDevice(TorchDevice):
 
         # shape: (b, n_head, s, s)
         attn_weights = attn_weights.view(b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        attn_weights = torch.where(mask, attn_weights, -6.5e4)
         attn_weights = attn_weights.view(b * n_head, s, s)
         attn_weights = F.softmax(attn_weights, dim=2)
         # shape: (b, n_head, s, head_dim)
         value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
+
+        # info = pynvml.nvmlDeviceGetMemoryInfo(h)
+        # print("3 total:", info.total, ", free:", info.free, ", used:", info.used)
+        del attn_weights
+        torch.cuda.empty_cache()
+
         # shape: (b, s, h)
         value = value.transpose(1, 2).reshape(b, s, h)
         value = F.linear(value, w_out.data)
@@ -1111,7 +1127,9 @@ class LlamaTorchDevice(TorchDevice):
         k = k.view(b, tgt_s, n_kv_head, head_dim)
         v = v.view(b, tgt_s, n_kv_head, head_dim)
 
-        cos, sin = rotary_embedding(v, w_re.data, seq_len=position_ids.max().item() + 1)
+        rotary_dim = w_re.data.shape[0] * 2
+        inv_freq = 1.0 / (50000000.0 ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))
+        cos, sin = rotary_embedding(v, inv_freq, seq_len=position_ids.max().item() + 1)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
         n_kv_groups = n_head // n_kv_head

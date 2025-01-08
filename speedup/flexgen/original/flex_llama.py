@@ -3,6 +3,7 @@ Usage:
 python3 -m flexgen.flex_llama --model meta-llama/Llama-2-7b-chat-hf --gpu-batch-size 32 --percent 100 0 100 0 100 0
 """
 import os
+import numpy as np
 import torch
 import argparse
 from typing import Union
